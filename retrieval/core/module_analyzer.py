@@ -10,6 +10,9 @@ from pathlib import Path
 from typing import List, Dict, Any
 import os
 from .utils import extract_module_path
+from repgen_logging import get_logger, trace
+
+logger = get_logger(__name__, component="retrieval.module_analyzer")
 
 class ModuleAnalyzer:
     """
@@ -64,7 +67,7 @@ class ModuleAnalyzer:
                 'code': snippet['page_content']
             })
         
-        return [
+        modules = [
             {
                 'module': module,
                 'files': [
@@ -83,3 +86,5 @@ class ModuleAnalyzer:
             }
             for module, files in module_map.items()
         ]
+        trace(logger, "Module analysis completed", stage="retrieval", action="analyze_modules", status="ok", details={"modules": len(modules), "snippets": len(relevant_code)})
+        return modules

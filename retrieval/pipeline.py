@@ -21,8 +21,9 @@ from .core.dependency_analyzer import DependencyAnalyzer
 from .core.utils import load_bug_report, save_json
 import json
 import logging
+from repgen_logging import get_logger, trace
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__, component="retrieval.pipeline")
 
 class RetrievalPipeline:
     """
@@ -58,6 +59,7 @@ class RetrievalPipeline:
             A dictionary containing the status and output directory path, or None if failed.
         """
         try:
+            bound_logger = logger.bind(bug_id=bug_id)
             # 1. Setup paths
             bug_report_path = self.config.BUG_REPORTS_DIR / f"{bug_id}.txt"
             code_dir = self.config.CODE_DIR
@@ -68,37 +70,37 @@ class RetrievalPipeline:
                 raise FileNotFoundError(f"Code directory not found: {code_dir}")
 
             # 2. Index codebase
-            logger.info(f"Indexing codebase for bug {bug_id}")
+            trace(bound_logger, "Indexing codebase", stage="retrieval", action="index_codebase", status="start")
             hybrid_index = self.code_indexer.index_codebase(code_dir)
 
             # 3. Find relevant code
-            logger.info(f"Finding relevant code for bug {bug_id}")
+            trace(bound_logger, "Finding relevant code", stage="retrieval", action="retrieve_chunks", status="start")
             bug_report = load_bug_report(bug_report_path)
             relevant_code = self.code_indexer.find_relevant_code(bug_report, hybrid_index)
             if not relevant_code:
-                logger.warning(f"No relevant code found for bug {bug_id}")
+                trace(bound_logger, "No relevant code found", level=logging.WARNING, stage="retrieval", action="retrieve_chunks", status="empty")
                 return None
 
             # 4. Analyze modules
-            logger.info(f"Analyzing modules for bug {bug_id}")
+            trace(bound_logger, "Analyzing modules", stage="retrieval", action="analyze_modules", status="start", details={"snippets": len(relevant_code)})
             module_report = {
                 'bug_report': bug_id,
                 'modules': self.module_analyzer.analyze_modules(relevant_code)
             }
             # 5. Detect training code
-            logger.info(f"Detecting training code for bug {bug_id}")
+            trace(bound_logger, "Detecting training code", stage="retrieval", action="detect_training_code", status="start", details={"modules": len(module_report["modules"])})
             training_report = self.training_detector.detect_training_code(module_report, bug_report_path)
   
             # # 6. Analyze dependencies
-            logger.info(f"Analyzing dependencies for bug {bug_id}")
+            trace(bound_logger, "Analyzing dependencies", stage="retrieval", action="analyze_dependencies", status="start", details={"training_files": len(training_report["training_files"])})
             dependency_report = self.dependency_analyzer.analyze_training_dependencies(training_report)
 
             # 7. Generate final context
-            logger.info(f"Generating final context for bug {bug_id}")
+            trace(bound_logger, "Generating final context", stage="retrieval", action="create_context_files", status="start", details={"dependencies": len(dependency_report.get("dependencies", []))})
             self.create_context_files(bug_id, module_report, dependency_report)
             return {"status": "success", "context_dir": str(self.config.CONTEXT_DIR_OUT)}
         except Exception as e:
-            logger.error(f"Pipeline failed for bug {bug_id}: {str(e)}")
+            trace(bound_logger, f"Pipeline failed: {str(e)}", level=logging.ERROR, stage="retrieval", action="run_pipeline", status="error")
             raise
 
     def create_context_files(self, bug_id, module_report, dependency_report):

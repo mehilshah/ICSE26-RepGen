@@ -13,14 +13,9 @@ import time
 import requests
 from pathlib import Path
 import json
+from repgen_logging import setup_logging, trace
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
-)
-logger = logging.getLogger()
+logger = setup_logging(logging.INFO).bind(component="baseline.generator")
 
 class CodeGenerator:
     """
@@ -43,8 +38,7 @@ class CodeGenerator:
     def generate(self, bug_report: str, technique: str = "zero_shot", n_examples: int = 3) -> str:
         """Generate reproduction code using specified technique and backend"""
         prompt = self._build_prompt(bug_report, technique, n_examples)
-        
-        logger.info(f"Using Backend: {self.backend} | Model: {self.model_name}")
+        trace(logger, "Baseline generation starting", stage="generation", action="baseline_generate", status="start", backend=self.backend, model=self.model_name, details={"technique": technique, "examples": n_examples, "prompt_chars": len(prompt)})
 
         if self.backend == "ollama":
             return self._ollama_local(prompt)

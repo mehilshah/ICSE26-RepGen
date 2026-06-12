@@ -13,15 +13,16 @@ from typing import List, Optional, Tuple, Any
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from annoy import AnnoyIndex
-from transformers import AutoTokenizer
-import torch
 from sklearn.preprocessing import normalize
-from ..core.utils import tokenize
+from ..core.utils import tokenize, get_torch_device
 import logging
+from repgen_logging import get_logger, trace
 
 # Suppress logs from transformers and sentence_transformers
 logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
+
+logger = get_logger(__name__, component="retrieval.hybrid_search")
 
 class HybridSearchIndex:
     """
@@ -31,19 +32,19 @@ class HybridSearchIndex:
         self,
         embedding_model: str,
         reranker_model: str,
-        device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+        device: Optional[str] = None,
         config: Optional[Any] = None
     ):
-        self.device = device
-        self.encoder = SentenceTransformer(embedding_model, device=device)
-        self.cross_encoder = CrossEncoder(reranker_model, device=device)
-        self.tokenizer = AutoTokenizer.from_pretrained(reranker_model)
+        self.device = get_torch_device(device or "cuda")
+        self.encoder = SentenceTransformer(embedding_model, device=self.device)
+        self.cross_encoder = CrossEncoder(reranker_model, device=self.device)
         self.max_seq_length = 512
         self.bm25 = None
         self.embeddings = None
         self.code_chunks = None
         self.annoy_index = None
         self.config = config
+        trace(logger, "Hybrid search initialized", stage="retrieval", action="init_hybrid_search", status="ok", details={"device": self.device, "embedding_model": embedding_model, "reranker_model": reranker_model})
 
     def build_index(self, code_chunks: List[dict], corpus: List[List[str]]) -> None:
         """
@@ -64,6 +65,7 @@ class HybridSearchIndex:
         self.embeddings = normalize(self.embeddings.cpu().numpy())
         
         self._build_annoy_index()
+        trace(logger, "Hybrid index built", stage="retrieval", action="build_index", status="ok", details={"chunks": len(code_chunks), "embedding_dim": self.embeddings.shape[1] if len(self.embeddings) else 0})
 
     def _build_annoy_index(self) -> None:
         """
@@ -181,6 +183,7 @@ class HybridSearchIndex:
         ann_indices = np.array(ann_indices, dtype=int)
 
         if len(ann_indices) == 0:
+            trace(logger, "Semantic search returned no candidates", level=logging.WARNING, stage="retrieval", action="semantic_search", status="empty")
             return []
 
         # Combine scores
@@ -192,22 +195,23 @@ class HybridSearchIndex:
         top_chunks = [self.code_chunks[i] for i in top_combined_indices]
         
         if self.config and self.config.AB_NO_RERANKER:
+            trace(logger, "Hybrid search completed without reranker", stage="retrieval", action="hybrid_search", status="ok", details={"ann_candidates": len(ann_indices), "returned": len(top_chunks)})
             return top_chunks
         
-        # Tokenize with proper truncation
-        features = self.tokenizer(
-            [query]*len(top_chunks),
-            [chunk['page_content'][:100000] for chunk in top_chunks],
-            padding=True,
-            truncation='longest_first',
-            max_length=self.max_seq_length,
-            return_tensors="pt"
-        ).to(self.device)
+        rerank_pairs = [
+            [query, chunk['page_content'][:100000]]
+            for chunk in top_chunks
+        ]
+        rerank_scores = np.asarray(
+            self.cross_encoder.predict(
+                rerank_pairs,
+                batch_size=16,
+                show_progress_bar=False
+            )
+        ).reshape(-1)
 
-        # Run cross-encoder
-        with torch.no_grad():
-            rerank_scores = self.cross_encoder.model(**features).logits.squeeze()
-        
         # Sort by cross-encoder scores
-        reranked_indices = np.argsort(rerank_scores.cpu().numpy())[::-1]
-        return [top_chunks[i] for i in reranked_indices]
+        reranked_indices = np.argsort(rerank_scores)[::-1]
+        results = [top_chunks[i] for i in reranked_indices]
+        trace(logger, "Hybrid search completed", stage="retrieval", action="hybrid_search", status="ok", details={"ann_candidates": len(ann_indices), "reranked": len(results), "alpha": alpha})
+        return results

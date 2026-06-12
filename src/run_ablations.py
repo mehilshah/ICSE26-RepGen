@@ -13,6 +13,7 @@ import sys
 import time
 from pathlib import Path
 from typing import List
+from repgen_logging import setup_logging, trace
 
 # --- 1. Define Retrieval Ablations ---
 # These map to the --retrieval_ablation flag in the tool script
@@ -40,12 +41,7 @@ GENERATION_ABLATIONS = [
 ]
 
 # --- 3. Setup Logging ---
-script_logger = logging.getLogger()
-script_logger.setLevel(logging.INFO)
-if not script_logger.hasHandlers():
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-    script_logger.addHandler(handler)
+script_logger = setup_logging(logging.INFO).bind(component="runner.ablations")
 
 # --- 4. Retry Function ---
 def run_command_with_retry(cmd: List[str], log_file: Path, max_attempts: int = 3):
@@ -61,7 +57,7 @@ def run_command_with_retry(cmd: List[str], log_file: Path, max_attempts: int = 3
         Exit code (0 for success, non-zero for failure).
     """
     for attempt in range(1, max_attempts + 1):
-        script_logger.info(f"Attempt {attempt} of {max_attempts}: {' '.join(cmd)}")
+        trace(script_logger, "Launching ablation command", stage="runner", action="execute_command", status="running", attempt=attempt, details={"max_attempts": max_attempts, "command": " ".join(cmd), "log_file": str(log_file)})
         
         try:
             # Capture both stdout and stderr to the log file
@@ -73,19 +69,19 @@ def run_command_with_retry(cmd: List[str], log_file: Path, max_attempts: int = 3
                     stdout=f,
                     stderr=subprocess.STDOUT
                 )
-            script_logger.info(f"Command succeeded. Log saved to: {log_file}")
+            trace(script_logger, "Ablation command succeeded", stage="runner", action="execute_command", status="ok", attempt=attempt, details={"log_file": str(log_file)})
             return 0 # Success
         except subprocess.CalledProcessError as e:
-            script_logger.warning(f"Command failed with exit code {e.returncode}. Retrying in 2s...")
+            trace(script_logger, "Ablation command failed; retrying", level=logging.WARNING, stage="runner", action="execute_command", status="retry", attempt=attempt, details={"exit_code": e.returncode, "log_file": str(log_file)})
             time.sleep(2)
         except FileNotFoundError:
-            script_logger.error(f"Error: 'python' command not found or script missing. Cannot continue.")
+            trace(script_logger, "Python executable or target script missing", level=logging.ERROR, stage="runner", action="execute_command", status="error")
             return 127 # Command not found
         except Exception as e:
-            script_logger.error(f"An unexpected error occurred: {e}. Retrying in 2s...")
+            trace(script_logger, f"Unexpected runner error: {e}", level=logging.ERROR, stage="runner", action="execute_command", status="retry", attempt=attempt)
             time.sleep(2)
     
-    script_logger.error(f"Command failed after {max_attempts} attempts. See log: {log_file}")
+    trace(script_logger, "Ablation command failed after max retries", level=logging.ERROR, stage="runner", action="execute_command", status="error", details={"max_attempts": max_attempts, "log_file": str(log_file)})
     return 1 # Failure
 
 # --- 5. Main Execution Logic ---

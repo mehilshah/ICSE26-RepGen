@@ -18,98 +18,9 @@ import json
 import logging
 from typing import Tuple, Dict, Any
 import ast
-
-# ==========================================
-# PRODUCTION LOGGING CONFIGURATION
-# ==========================================
-SUCCESS_LEVEL_NUM = 25
-logging.addLevelName(SUCCESS_LEVEL_NUM, "SUCCESS")
-
-def success(self, message, *args, **kws):
-    if self.isEnabledFor(SUCCESS_LEVEL_NUM):
-        self._log(SUCCESS_LEVEL_NUM, message, args, **kws)
-
-logging.Logger.success = success
-
-class ProductionFormatter(logging.Formatter):
-    """
-    Produces aligned, colored logs similar to Nginx or sophisticated CLI tools.
-    Format: [HH:MM:SS] [LEVEL  ] Message
-    """
-    # ANSI Colors
-    GREY = "\x1b[38;5;240m"
-    BLUE = "\x1b[38;5;39m"
-    GREEN = "\x1b[38;5;82m"
-    YELLOW = "\x1b[38;5;226m"
-    RED = "\x1b[38;5;196m"
-    BOLD_RED = "\x1b[31;1m"
-    MAGENTA = "\x1b[38;5;213m"
-    CYAN = "\x1b[38;5;51m"
-    RESET = "\x1b[0m"
-
-    def format(self, record):
-        # Timestamp in Grey
-        dt = self.formatTime(record, "%H:%M:%S")
-        timestamp = f"{self.GREY}{dt}{self.RESET}"
-
-        # Level with color
-        if record.levelno == logging.INFO:
-            level_fmt = f"{self.BLUE}[INFO]{self.RESET}"
-        elif record.levelno == SUCCESS_LEVEL_NUM:
-            level_fmt = f"{self.GREEN}[SUCCESS]{self.RESET}"
-        elif record.levelno == logging.WARNING:
-            level_fmt = f"{self.YELLOW}[WARNING]{self.RESET}"
-        elif record.levelno == logging.ERROR:
-            level_fmt = f"{self.RED}[ERROR]{self.RESET}"
-        elif record.levelno == logging.CRITICAL:
-            level_fmt = f"{self.BOLD_RED}[CRITICAL]{self.RESET}"
-        elif record.levelno == logging.DEBUG:
-            level_fmt = f"{self.GREY}[DEBUG]{self.RESET}"
-        else:
-            level_fmt = f"{self.CYAN}[CUSTOM]{self.RESET}"
-
-        # Add context information if available
-        context = ""
-        if hasattr(record, 'bug_id'):
-            context = f"{self.MAGENTA}[Bug {record.bug_id}]{self.RESET} "
-        if hasattr(record, 'context_num'):
-            context += f"{self.CYAN}[Ctx {record.context_num}]{self.RESET} "
-        if hasattr(record, 'attempt'):
-            context += f"{self.YELLOW}[Att {record.attempt}]{self.RESET} "
-
-        return f"{timestamp} {level_fmt} {context}{record.getMessage()}"
-
-def setup_logging(log_level=logging.INFO, log_file=None):
-    """
-    Set up production-ready logging with optional file output.
-    """
-    logger = logging.getLogger()
-    logger.setLevel(log_level)
-    
-    # Prevent duplicate handlers
-    if logger.hasHandlers():
-        logger.handlers.clear()
-
-    # Console handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(ProductionFormatter())
-    logger.addHandler(console_handler)
-    
-    # File handler (optional)
-    if log_file:
-        file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
-        file_formatter = logging.Formatter(
-            '%(asctime)s [%(levelname)-8s] %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
-        file_handler.setFormatter(file_formatter)
-        logger.addHandler(file_handler)
-        logger.info(f"Logging to file: {log_file}")
-    
-    return logger
+from repgen_logging import setup_logging, trace
 
 logger = setup_logging()
-# ==========================================
 
 # Set environment variables at the start
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -143,6 +54,16 @@ def query_ollama(prompt: str, model: str) -> str:
     Mimics the signature of query_openai_api for consistency.
     """
     try:
+        trace(
+            logger,
+            "Dispatching prompt to local model",
+            stage="generation",
+            action="llm_call",
+            status="start",
+            model=model,
+            backend="ollama",
+            details={"prompt_chars": len(prompt)},
+        )
         cmd = ['ollama', 'run', model]
         # Use Popen to pipe input correctly
         process = subprocess.Popen(
@@ -156,12 +77,40 @@ def query_ollama(prompt: str, model: str) -> str:
         stdout, stderr = process.communicate(input=prompt)
         
         if process.returncode != 0:
-            logger.error(f"Ollama Error ({model}): {stderr.strip()}")
+            trace(
+                logger,
+                "Local model call failed",
+                level=logging.ERROR,
+                stage="generation",
+                action="llm_call",
+                status="error",
+                model=model,
+                backend="ollama",
+                details={"stderr": stderr.strip()[:200]},
+            )
             return ""
-            
+        trace(
+            logger,
+            "Local model response received",
+            stage="generation",
+            action="llm_call",
+            status="ok",
+            model=model,
+            backend="ollama",
+            details={"response_chars": len(stdout.strip())},
+        )
         return stdout.strip()
     except FileNotFoundError:
-        logger.critical("Ollama binary not found. Is it installed?")
+        trace(
+            logger,
+            "Ollama binary not found",
+            level=logging.CRITICAL,
+            stage="generation",
+            action="llm_call",
+            status="error",
+            model=model,
+            backend="ollama",
+        )
         return ""
     except Exception as e:
         logger.error(f"Ollama execution failed: {e}")
@@ -213,17 +162,22 @@ def main():
     global logger
     log_level = getattr(logging, args.log_level.upper())
     logger = setup_logging(log_level=log_level, log_file=args.log_file)
+    logger = logger.bind(bug_id=args.bug_id)
     
-    logger.info("=" * 60)
-    logger.info("RepGen Code Generation Pipeline (Local/Ollama) - Starting")
-    logger.info("=" * 60)
-    logger.info(f"Bug ID: {args.bug_id}", extra={'bug_id': args.bug_id})
-    logger.info(f"Retrieval Ablation: {args.retrieval_ablation}")
-    logger.info(f"Generation Ablation: {args.generation_ablation}")
-    logger.info(f"Max Attempts: {args.max_attempts}")
-    if args.ae_dataset_path:
-        logger.info(f"Custom Dataset Path: {args.ae_dataset_path}")
-    logger.info("=" * 60)
+    trace(
+        logger,
+        "RepGen local pipeline starting",
+        stage="pipeline",
+        action="bootstrap",
+        status="start",
+        backend="ollama",
+        details={
+            "retrieval_ablation": args.retrieval_ablation,
+            "generation_ablation": args.generation_ablation,
+            "max_attempts": args.max_attempts,
+            "dataset_path": args.ae_dataset_path or "default",
+        },
+    )
 
     # Setup pipeline and flags
     ret_ablation_name = args.retrieval_ablation
@@ -232,7 +186,7 @@ def main():
     ret_ablation_dict = RETRIEVAL_ABLATION_CONFIGS.get(ret_ablation_name, {})
     gen_flags = GENERATION_ABLATION_MAP.get(gen_ablation_name, {})
     
-    logger.info("Initializing retrieval pipeline...", extra={'bug_id': args.bug_id})
+    trace(logger, "Initializing retrieval pipeline", stage="retrieval", action="init", status="start")
     try:
         pipeline = RetrievalPipeline(
             bug_id=args.bug_id, 
@@ -242,15 +196,15 @@ def main():
             dataset_dir=args.ae_dataset_path
         )
     except Exception as e:
-        logger.error(f"Failed to initialize pipeline: {e}", exc_info=True, extra={'bug_id': args.bug_id})
+        trace(logger, f"Failed to initialize retrieval pipeline: {e}", level=logging.ERROR, stage="retrieval", action="init", status="error")
         return
     
-    logger.info("Running retrieval pipeline...", extra={'bug_id': args.bug_id})
+    trace(logger, "Running retrieval pipeline", stage="retrieval", action="run", status="start")
     try:
         result = pipeline.run_pipeline(args.bug_id)
-        logger.success(f"Retrieval pipeline completed: {result.get('status', 'Done')}", extra={'bug_id': args.bug_id})
+        trace(logger, "Retrieval pipeline completed", level=25, stage="retrieval", action="run", status="ok", details=result)
     except Exception as e:
-        logger.error(f"Retrieval pipeline failed: {e}", exc_info=True, extra={'bug_id': args.bug_id})
+        trace(logger, f"Retrieval pipeline failed: {e}", level=logging.ERROR, stage="retrieval", action="run", status="error")
         return
  
     # Get all paths from config
@@ -272,12 +226,10 @@ def main():
     refined_report_path = refined_report_dir / f"{args.bug_id}.txt"
     
     # STEP 1: Bug Report Refinement
-    logger.info("─" * 60)
-    logger.info("STEP 1/3: Bug Report Refinement", extra={'bug_id': args.bug_id})
-    logger.info("─" * 60)
+    trace(logger, "Starting bug report refinement", stage="generation", action="refine_bug_report", status="start")
     
     if not gen_flags.get("no_refine", False):
-        logger.info("Refining bug report with Ollama (qwen2.5:7b)...", extra={'bug_id': args.bug_id})
+        trace(logger, "Requesting refined bug report", stage="generation", action="refine_bug_report", status="running", model="qwen2.5:7b", backend="ollama")
         prompt_refinement = create_prompt_refinement(bug_report_content)
         
         # Use query_ollama helper
@@ -287,36 +239,34 @@ def main():
             try:
                 with open(refined_report_path, 'w', encoding='utf-8') as f:
                     f.write(accumulated_output)
-                logger.success(f"Refined bug report saved: {refined_report_path.name}", extra={'bug_id': args.bug_id})
+                trace(logger, "Refined bug report saved", level=25, stage="generation", action="refine_bug_report", status="ok", details={"file": refined_report_path.name})
             except Exception as e:
                 logger.error(f"Failed to save refined report: {e}", extra={'bug_id': args.bug_id})
         else:
-            logger.warning("Ollama returned empty response, using original report", extra={'bug_id': args.bug_id})
+            trace(logger, "Refinement returned empty response; using original report", level=logging.WARNING, stage="generation", action="refine_bug_report", status="fallback")
             with open(refined_report_path, 'w', encoding='utf-8') as f:
                 f.write(bug_report_content)
     else:
-        logger.info("Refinement skipped (ablation active). Using original report.", extra={'bug_id': args.bug_id})
+        trace(logger, "Refinement skipped by ablation", stage="generation", action="refine_bug_report", status="skipped")
         with open(refined_report_path, 'w', encoding='utf-8') as f:
             f.write(bug_report_content)
     
     # STEP 2: Plan Generation
-    logger.info("─" * 60)
-    logger.info("STEP 2/3: Plan Generation", extra={'bug_id': args.bug_id})
-    logger.info("─" * 60)
+    trace(logger, "Starting plan generation", stage="generation", action="build_plan", status="start")
     
     context_dir = config.CONTEXT_DIR_IN 
     plan_dir = config.PLANS_DIR_OUT
     
     try:
         context_files_list = os.listdir(context_dir)
-        logger.info(f"Found {len(context_files_list)} context files", extra={'bug_id': args.bug_id})
+        trace(logger, "Enumerated context files for plan generation", stage="generation", action="build_plan", status="ok", details={"contexts": len(context_files_list)})
     except Exception as e:
         logger.error(f"Failed to list context files: {e}", extra={'bug_id': args.bug_id})
         return
     
     for idx, context_file in enumerate(context_files_list, 1):
         context_path = os.path.join(context_dir, context_file)
-        logger.info(f"Processing context {idx}/{len(context_files_list)}: {context_file}", extra={'bug_id': args.bug_id})
+        trace(logger, "Generating plan for context", stage="generation", action="build_plan", status="running", context_num=idx, details={"context_file": context_file})
         
         try:
             with open(context_path, 'r', encoding='utf-8') as f:
@@ -343,14 +293,12 @@ def main():
         try:
             with open(plan_path, 'w', encoding='utf-8') as f:
                 f.write(output)
-            logger.success(f"Plan saved: {plan_path.name}", extra={'bug_id': args.bug_id})
+            trace(logger, "Plan saved", level=25, stage="generation", action="build_plan", status="ok", context_num=idx, details={"file": plan_path.name})
         except Exception as e:
             logger.error(f"Failed to save plan: {e}", extra={'bug_id': args.bug_id})
 
     # STEP 3: Code Generation
-    logger.info("─" * 60)
-    logger.info("STEP 3/3: Code Generation & Verification", extra={'bug_id': args.bug_id})
-    logger.info("─" * 60)
+    trace(logger, "Starting code generation and verification", stage="generation", action="generate_code", status="start")
     
     refined_report_path = config.REFINED_BUG_REPORT_DIR_IN / f"{args.bug_id}.txt"
     try:
@@ -363,7 +311,7 @@ def main():
     try:
         context_files = sorted(config.CONTEXT_DIR_IN.glob("*.json"), 
                               key=lambda x: int(x.stem.split('_')[-1]))
-        logger.info(f"Processing {len(context_files)} contexts", extra={'bug_id': args.bug_id})
+        trace(logger, "Enumerated generation contexts", stage="generation", action="generate_code", status="ok", details={"contexts": len(context_files)})
     except Exception as e:
         logger.error(f"Failed to enumerate contexts: {e}", extra={'bug_id': args.bug_id})
         return
@@ -374,10 +322,7 @@ def main():
     for ctx_idx, context_file in enumerate(context_files, 1):
         context_num = context_file.stem.split('_')[-1]
         
-        logger.info("=" * 60, extra={'bug_id': args.bug_id, 'context_num': context_num})
-        logger.info(f"Processing Context {ctx_idx}/{len(context_files)} (ID: {context_num})", 
-                   extra={'bug_id': args.bug_id, 'context_num': context_num})
-        logger.info("=" * 60, extra={'bug_id': args.bug_id, 'context_num': context_num})
+        trace(logger, "Processing generation context", stage="generation", action="generate_code", status="running", context_num=context_num, details={"context_index": f"{ctx_idx}/{len(context_files)}"})
         
         try:
             with open(context_file, 'r', encoding='utf-8') as f:
@@ -404,8 +349,7 @@ def main():
         success = False
         
         for attempt in range(max_attempts):
-            logger.info(f"Attempt {attempt + 1}/{max_attempts}", 
-                       extra={'bug_id': args.bug_id, 'context_num': context_num, 'attempt': attempt + 1})
+            trace(logger, "Generation attempt started", stage="generation", action="generate_code", status="running", context_num=context_num, attempt=attempt + 1, details={"max_attempts": max_attempts})
             
             # Code generation uses qwen2.5-coder:7b
             stdout = query_ollama(prompt_code, model='qwen2.5-coder:7b')
@@ -537,9 +481,7 @@ def main():
             logger.error(f"Failed to generate valid code for context {context_num} after {max_attempts} attempts", 
                         extra={'bug_id': args.bug_id, 'context_num': context_num})
 
-    logger.info("=" * 60)
-    logger.info("Pipeline Completed", extra={'bug_id': args.bug_id})
-    logger.info("=" * 60)
+    trace(logger, "Pipeline completed", stage="pipeline", action="run", status="ok", backend="ollama")
 
 def analyze_with_pylint(code: str, file_path: Path):
     result = []

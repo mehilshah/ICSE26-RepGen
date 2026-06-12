@@ -10,8 +10,9 @@ import os
 from pathlib import Path
 from typing import Dict, List, Any, Set, Tuple
 import logging
+from repgen_logging import get_logger, trace
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__, component="retrieval.dependency_analyzer")
 
 class DependencyAnalyzer:
     """
@@ -127,6 +128,7 @@ class DependencyAnalyzer:
             Dictionary containing bug report and dependency analysis for each file.
         """
         report = []
+        trace(logger, "Analyzing training file dependencies", stage="retrieval", action="analyze_dependencies", status="start", details={"training_files": len(training_report['training_files'])})
         
         for entry in training_report['training_files']:
             try:
@@ -147,6 +149,7 @@ class DependencyAnalyzer:
                 logger.warning(f"Error processing {entry.get('file')}: {e}")
                 continue
         
+        trace(logger, "Dependency analysis completed", stage="retrieval", action="analyze_dependencies", status="ok", details={"dependency_reports": len(report)})
         return {
             "bug_report": training_report["bug_report"],
             "dependencies": sorted(report, key=lambda x: x["score"], reverse=True)

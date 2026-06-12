@@ -10,12 +10,12 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Any
 import numpy as np
 from sentence_transformers import CrossEncoder
-from transformers import AutoTokenizer
-import torch
 import os
 import logging
+from .utils import get_torch_device
+from repgen_logging import get_logger, trace
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__, component="retrieval.training_detector")
 
 import ast
 
@@ -157,10 +157,9 @@ class TrainingCodeDetector:
     """
     def __init__(self, config):
         self.config = config
-        self.reranker = CrossEncoder(config.RERANKER_MODEL)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.RERANKER_MODEL)
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.reranker.to(self.device)
+        self.device = get_torch_device()
+        self.reranker = CrossEncoder(config.RERANKER_MODEL, device=self.device)
+        trace(logger, "Training detector initialized", stage="retrieval", action="init_training_detector", status="ok", details={"device": self.device, "model": config.RERANKER_MODEL})
 
     def contains_training(self, file_path: Path) -> bool:
         """
@@ -230,27 +229,28 @@ class TrainingCodeDetector:
             List of tuples (file_path, relevance_score), sorted by score descending.
         """
         if not files:
+            trace(logger, "No training candidates available for ranking", stage="retrieval", action="rank_training_files", status="empty")
             return []
-            
-        # Tokenize with proper truncation
-        features = self.tokenizer(
-            [bug_report[:100000]] * len(files),
-            [file.read_text(encoding='utf-8')[:100000] for file in files],
-            padding=True,
-            truncation='longest_first',
-            max_length=512,
-            return_tensors="pt"
-        ).to(self.device)
-        
-        # Run cross-encoder
-        with torch.no_grad():
-            scores = self.reranker(**features).logits.squeeze().cpu().numpy()
+
+        pairs = [
+            [bug_report[:100000], file.read_text(encoding='utf-8')[:100000]]
+            for file in files
+        ]
+        scores = np.asarray(
+            self.reranker.predict(
+                pairs,
+                batch_size=16,
+                show_progress_bar=False
+            )
+        ).reshape(-1)
         
         # Normalize scores
         if len(scores) > 1:
             scores = (scores - scores.min()) / (scores.max() - scores.min() + 1e-8)
         
-        return sorted(zip(files, scores), key=lambda x: x[1], reverse=True)
+        ranked = sorted(zip(files, scores), key=lambda x: x[1], reverse=True)
+        trace(logger, "Training file ranking completed", stage="retrieval", action="rank_training_files", status="ok", details={"candidates": len(files), "ranked": len(ranked)})
+        return ranked
 
     def detect_training_code(self, module_report: Dict[str, Any], bug_report_path: Path) -> Dict[str, Any]:
         """
@@ -268,6 +268,7 @@ class TrainingCodeDetector:
         """
         bug_report = bug_report_path.read_text(encoding='utf-8')
         all_files = self._get_all_files(module_report)
+        trace(logger, "Collected training-code candidates", stage="retrieval", action="collect_training_candidates", status="ok", details={"candidates": len(all_files)})
         
         training_files = []
         if self.config.AB_NO_TRAINING_LOOP_EXTRACTION:
@@ -277,6 +278,7 @@ class TrainingCodeDetector:
             for file in all_files:
                 if self.contains_training(file):
                     training_files.append(file)
+        trace(logger, "Training loop detection completed", stage="retrieval", action="detect_training_code", status="ok", details={"detected": len(training_files), "ablation_skip_extraction": self.config.AB_NO_TRAINING_LOOP_EXTRACTION})
         
         if self.config.AB_NO_TRAINING_LOOP_RANKING:
             # Skip ranking, return all found training files with a dummy score
@@ -284,6 +286,7 @@ class TrainingCodeDetector:
         else:
             # Original ranking logic
             ranked_files = self._rank_files(training_files, bug_report)
+        trace(logger, "Training code report ready", stage="retrieval", action="detect_training_code", status="ok", details={"ranked_files": len(ranked_files), "ablation_skip_ranking": self.config.AB_NO_TRAINING_LOOP_RANKING})
         # --- END MODIFICATION ---
         
         return {

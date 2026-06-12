@@ -17,8 +17,9 @@ from typing import List, Dict, Any, Optional
 from ..models.hybrid_search import HybridSearchIndex
 from .utils import tokenize, save_json, load_json
 import logging
+from repgen_logging import get_logger, trace
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__, component="retrieval.code_indexer")
 
 class CodeIndexer:
     """
@@ -122,6 +123,7 @@ class CodeIndexer:
         """
         files = [f for f in code_dir.glob("**/*.py") 
                 if "__pycache__" not in str(f) and not any(part.startswith('.') for part in f.parts)]
+        trace(logger, "Scanning codebase files", stage="retrieval", action="scan_files", status="ok", details={"files": len(files)})
         
         with Pool(cpu_count()) as pool:
             docs = pool.map(self._load_file, files)
@@ -132,6 +134,7 @@ class CodeIndexer:
             chunks.extend(self._semantic_chunking(doc))
         
         corpus = [tokenize(chunk['page_content']) for chunk in chunks]
+        trace(logger, "Prepared semantic chunks", stage="retrieval", action="build_chunks", status="ok", details={"documents": len(valid_docs), "chunks": len(chunks)})
         return chunks, corpus
 
     def index_codebase(self, code_dir: Path) -> HybridSearchIndex:
@@ -157,16 +160,16 @@ class CodeIndexer:
         )
         
         if (index_dir / "documents.json").exists():
-            logger.info("Loading existing index")
+            trace(logger, "Loading existing hybrid index", stage="retrieval", action="load_index", status="start", details={"index_dir": str(index_dir)})
             hybrid_index.load_index(index_dir)
             return hybrid_index
             
-        logger.info("Building new index")
+        trace(logger, "Building new hybrid index", stage="retrieval", action="build_index", status="start", details={"index_dir": str(index_dir)})
         chunks, corpus = self._process_codebase(code_dir)
         hybrid_index.build_index(chunks, corpus)
         hybrid_index.save_index(index_dir)
         
-        logger.info(f"Indexing completed in {time.time()-start_time:.2f}s")
+        trace(logger, "Indexing completed", stage="retrieval", action="build_index", status="ok", details={"elapsed_s": f"{time.time()-start_time:.2f}", "chunks": len(chunks)})
         return hybrid_index
 
     def find_relevant_code(self, bug_report: str, hybrid_index: HybridSearchIndex) -> List[dict]:
@@ -180,9 +183,11 @@ class CodeIndexer:
         Returns:
             List of top-k relevant code chunks.
         """
-        return hybrid_index.search(
+        results = hybrid_index.search(
             bug_report,
             top_k=self.config.SEARCH_TOP_K,
             rerank_top_k=self.config.RERANK_TOP_K,
             alpha=self.config.ALPHA
         )
+        trace(logger, "Relevant code retrieval completed", stage="retrieval", action="retrieve_chunks", status="ok", details={"results": len(results), "rerank_top_k": self.config.RERANK_TOP_K})
+        return results
